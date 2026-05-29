@@ -1,87 +1,189 @@
-"""Your ARC-AGI-3 agent. This is the *only* file you should normally edit.
+"""Mini-Palari ARC-AGI-3 milestone agent.
 
-`scripts/build_notebook.py` splices the contents of this file into the
-Kaggle submission notebook, so your local dev loop and your Kaggle
-submission stay in lock-step:
-
-    [edit my_agent.py] → [make play-local] → [make submit]
-
-The default body below is a port of the Stochastic Goose / random_agent
-sample — a known-good baseline that produces a valid submission and
-proves your end-to-end pipeline works. Replace `choose_action` with your
-real strategy.
-
-Contract (enforced by the ARC-AGI-3-Agents framework):
-  - Subclass `agents.agent.Agent`.
-  - Class must be named `MyAgent` (the notebook's __init__.py registers it).
-  - Implement `is_done(frames, latest_frame) -> bool`.
-  - Implement `choose_action(frames, latest_frame) -> GameAction`.
+This file is intentionally self-contained because the official starter splices it
+into the Kaggle notebook.  The policy mirrors Mini-Palari's submission-facing
+baseline in the main repo: deterministic, no network/model calls, reset-safe,
+and bounded ACTION6 coordinate selection from current public frame salience.
 """
 from __future__ import annotations
 
-import random
-import time
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from arcengine import FrameData, GameAction, GameState
-
-# When run inside the ARC-AGI-3-Agents framework (locally or on Kaggle)
-# the `agents` package is on sys.path, so this import resolves.
 from agents.agent import Agent
+
+ACTION_BY_NUMBER = {index: f"ACTION{index}" for index in range(1, 8)} | {0: "RESET"}
+RESET_STATES = frozenset({"NOT_PLAYED", "GAME_OVER"})
+WIN_STATE = "WIN"
+DEFAULT_SIMPLE_PROBE_SEQUENCE = ("ACTION4", "ACTION1", "ACTION2", "ACTION3", "ACTION5", "ACTION7")
+
+
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _state_name(value: Any) -> str:
+    raw = _field(value, "name", value)
+    if raw is None:
+        return ""
+    text = str(raw).strip().upper()
+    if text.startswith("GAMESTATE."):
+        text = text.rsplit(".", 1)[-1]
+    return text
+
+
+def action_name_from_value(value: Any) -> str:
+    raw = _field(value, "name", value)
+    if isinstance(raw, bool):
+        raise ValueError("action identifiers cannot be booleans")
+    if isinstance(raw, int):
+        if raw in ACTION_BY_NUMBER:
+            return ACTION_BY_NUMBER[raw]
+        raise ValueError(f"unsupported action number: {raw!r}")
+    text = str(raw).strip().upper()
+    if text.startswith("GAMEACTION."):
+        text = text.rsplit(".", 1)[-1]
+    if text.isdecimal():
+        return action_name_from_value(int(text))
+    if text == "RESET" or text in ACTION_BY_NUMBER.values():
+        return text
+    raise ValueError(f"unsupported action identifier: {value!r}")
+
+
+def _latest_grid(frame_payload: Any) -> list[list[int]]:
+    if not isinstance(frame_payload, Sequence) or isinstance(frame_payload, (str, bytes, bytearray)) or not frame_payload:
+        return [[0]]
+    latest = frame_payload[-1]
+    if not isinstance(latest, Sequence) or isinstance(latest, (str, bytes, bytearray)) or not latest:
+        return [[0]]
+    rows: list[list[int]] = []
+    for row in latest:
+        if not isinstance(row, Sequence) or isinstance(row, (str, bytes, bytearray)):
+            continue
+        clean_row: list[int] = []
+        for cell in row:
+            if isinstance(cell, bool) or not isinstance(cell, int):
+                clean_row.append(0)
+            else:
+                clean_row.append(max(0, min(15, int(cell))))
+        if clean_row:
+            rows.append(clean_row)
+    return rows or [[0]]
+
+
+def salient_coordinate(frame_payload: Any) -> dict[str, int]:
+    grid = _latest_grid(frame_payload)
+    points: list[tuple[int, int]] = []
+    for y, row in enumerate(grid):
+        for x, cell in enumerate(row):
+            if cell:
+                points.append((x, y))
+    if not points:
+        width = max(len(row) for row in grid)
+        height = len(grid)
+        return {"x": min(63, max(0, width // 2)), "y": min(63, max(0, height // 2))}
+    avg_x = round(sum(x for x, _y in points) / len(points))
+    avg_y = round(sum(y for _x, y in points) / len(points))
+    return {"x": min(63, max(0, avg_x)), "y": min(63, max(0, avg_y))}
+
+
+def available_action_names(latest_frame: Any, actions_by_name: Mapping[str, Any]) -> list[str]:
+    raw_available = _field(latest_frame, "available_actions")
+    if raw_available is None:
+        action_input = _field(latest_frame, "action_input")
+        raw_available = _field(action_input, "available_actions")
+    if raw_available is None:
+        raw_available = [name for name in actions_by_name if name != "RESET"]
+    names: list[str] = []
+    for item in raw_available:
+        try:
+            name = action_name_from_value(item)
+        except ValueError:
+            continue
+        if name in actions_by_name and name not in names:
+            names.append(name)
+    return names
+
+
+def _attach_reasoning(action: Any, reasoning: Any) -> Any:
+    try:
+        action.reasoning = reasoning
+    except Exception:
+        pass
+    return action
+
+
+class MiniPalariArcAgi3Policy:
+    def __init__(
+        self,
+        game_id: str,
+        simple_probe_sequence: tuple[str, ...] = DEFAULT_SIMPLE_PROBE_SEQUENCE,
+    ) -> None:
+        self.game_id = game_id
+        self.simple_probe_sequence = simple_probe_sequence
+        self.turn_index = 0
+        self.trace_notes: list[dict[str, Any]] = []
+
+    def is_done(self, latest_frame: Any) -> bool:
+        return _state_name(_field(latest_frame, "state")) == WIN_STATE
+
+    def choose_action(self, frames: Sequence[Any], latest_frame: Any, actions_by_name: Mapping[str, Any]) -> Any:
+        state = _state_name(_field(latest_frame, "state"))
+        if state in RESET_STATES:
+            action = actions_by_name["RESET"]
+            return _attach_reasoning(action, f"mini-palari reset: state={state}")
+
+        available = available_action_names(latest_frame, actions_by_name)
+        if "ACTION6" in available and len(available) == 1:
+            action = actions_by_name["ACTION6"]
+            coordinate = salient_coordinate(_field(latest_frame, "frame"))
+            if hasattr(action, "set_data"):
+                action.set_data(coordinate)
+            return _attach_reasoning(
+                action,
+                {"policy": "mini-palari action6 salient-coordinate baseline", "coordinate": coordinate, "frame_count": len(frames)},
+            )
+
+        non_reset = [name for name in available if name != "RESET"]
+        for offset in range(len(self.simple_probe_sequence)):
+            name = self.simple_probe_sequence[(self.turn_index + offset) % len(self.simple_probe_sequence)]
+            if name in non_reset:
+                self.turn_index += offset + 1
+                return _attach_reasoning(
+                    actions_by_name[name],
+                    f"mini-palari deterministic simple probe: {name}; game={self.game_id}",
+                )
+
+        if "ACTION6" in non_reset:
+            action = actions_by_name["ACTION6"]
+            coordinate = salient_coordinate(_field(latest_frame, "frame"))
+            if hasattr(action, "set_data"):
+                action.set_data(coordinate)
+            self.turn_index += 1
+            return _attach_reasoning(action, {"policy": "mini-palari action6 fallback", "coordinate": coordinate})
+
+        action = actions_by_name["RESET"]
+        return _attach_reasoning(action, "mini-palari fallback reset: no usable non-reset action")
 
 
 class MyAgent(Agent):
-    """Picks legal actions uniformly at random. Replace with your strategy."""
+    """Deterministic no-network Mini-Palari baseline for milestone submission."""
 
-    # Upper bound on actions per game; the framework also enforces global limits.
     MAX_ACTIONS = 80
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        # Seed per game_id so replays from the same game are reproducible but
-        # different games explore independently.
-        seed = int(time.time() * 1_000_000) + hash(self.game_id) % 1_000_000
-        random.seed(seed)
+        self.policy = MiniPalariArcAgi3Policy(game_id=self.game_id)
 
     @property
     def name(self) -> str:
-        return f"{super().name}.{self.MAX_ACTIONS}"
+        return f"{super().name}.mini-palari-v0.{self.MAX_ACTIONS}"
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
-        # Stop once we win. Don't stop on GAME_OVER — we want to RESET and retry.
-        return latest_frame.state is GameState.WIN
+        return self.policy.is_done(latest_frame)
 
-    def choose_action(
-        self, frames: list[FrameData], latest_frame: FrameData
-    ) -> GameAction:
-        # First call or after a death → reset the level.
-        if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
-            return GameAction.RESET
-
-        # ── Per-game strategy fork ───────────────────────────────────────────
-        # By default every game uses the same uniformly-random strategy in the
-        # `else` branch below. This `if` shows ONE example of giving a single
-        # game its own heuristic: on LS20 we bias the random pick so ACTION4
-        # is twice as likely as any other action. Add more `elif` branches to
-        # specialize other games.
-        #
-        # `self.game_id` is set by the framework. It may be the short id
-        # ("ls20") or include a version suffix ("ls20-9607627b"), so we
-        # compare on the prefix to be safe.
-        candidate_actions = [a for a in GameAction if a is not GameAction.RESET]
-        if self.game_id.split("-")[0] == "ls20":
-            weights = [2 if a is GameAction.ACTION4 else 1 for a in candidate_actions]
-            action = random.choices(candidate_actions, weights=weights, k=1)[0]
-        else:
-            action = random.choice(candidate_actions)
-        # ────────────────────────────────────────────────────────────────────
-
-        if action.is_complex():
-            # ACTION6 takes (x, y) coordinates on a 64×64 grid.
-            action.set_data(
-                {"x": random.randint(0, 63), "y": random.randint(0, 63)}
-            )
-            action.reasoning = {"why": "random complex action"}
-        else:
-            action.reasoning = f"random simple action: {action.value}"
-        return action
+    def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
+        actions_by_name = {action.name: action for action in GameAction}
+        return self.policy.choose_action(frames, latest_frame, actions_by_name)
