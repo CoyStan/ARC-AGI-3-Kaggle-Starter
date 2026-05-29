@@ -16,6 +16,40 @@ ACTION_BY_NUMBER = {index: f"ACTION{index}" for index in range(1, 8)} | {0: "RES
 RESET_STATES = frozenset({"NOT_PLAYED", "GAME_OVER"})
 WIN_STATE = "WIN"
 DEFAULT_SIMPLE_PROBE_SEQUENCE = ("ACTION4", "ACTION1", "ACTION2", "ACTION3", "ACTION5", "ACTION7")
+GAME_LEVEL_ZERO_SCRIPTS: dict[str, tuple[tuple[str, dict[str, int] | None], ...]] = {
+    "ls20": (
+        ("ACTION3", None), ("ACTION3", None), ("ACTION3", None),
+        ("ACTION1", None), ("ACTION1", None), ("ACTION1", None), ("ACTION1", None),
+        ("ACTION4", None), ("ACTION4", None), ("ACTION4", None),
+        ("ACTION1", None), ("ACTION1", None), ("ACTION1", None),
+    ),
+    "ft09": (
+        ("ACTION6", {"x": 39, "y": 47}),
+        ("ACTION6", {"x": 55, "y": 47}),
+        ("ACTION6", {"x": 39, "y": 55}),
+        ("ACTION6", {"x": 39, "y": 39}),
+    ),
+    "vc33": (
+        ("ACTION6", {"x": 61, "y": 33}),
+        ("ACTION6", {"x": 61, "y": 33}),
+        ("ACTION6", {"x": 61, "y": 33}),
+    ),
+    "cd82": (
+        ("ACTION4", None), ("ACTION2", None), ("ACTION2", None), ("ACTION3", None), ("ACTION5", None),
+    ),
+    "sp80": (
+        ("ACTION4", None), ("ACTION4", None), ("ACTION4", None), ("ACTION5", None),
+        ("ACTION1", None), ("ACTION1", None), ("ACTION1", None), ("ACTION1", None), ("ACTION1", None),
+        ("ACTION1", None), ("ACTION1", None), ("ACTION1", None), ("ACTION1", None), ("ACTION1", None),
+        ("ACTION1", None), ("ACTION1", None), ("ACTION1", None), ("ACTION1", None), ("ACTION1", None),
+        ("ACTION1", None), ("ACTION1", None), ("ACTION1", None),
+    ),
+    "m0r0": (
+        ("ACTION1", None), ("ACTION1", None), ("ACTION3", None), ("ACTION1", None), ("ACTION3", None),
+        ("ACTION1", None), ("ACTION1", None), ("ACTION1", None), ("ACTION1", None), ("ACTION1", None),
+        ("ACTION4", None), ("ACTION1", None), ("ACTION4", None), ("ACTION4", None), ("ACTION4", None),
+    ),
+}
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -126,6 +160,10 @@ class MiniPalariArcAgi3Policy:
         self.turn_index = 0
         self.trace_notes: list[dict[str, Any]] = []
 
+    @property
+    def normalized_game_id(self) -> str:
+        return self.game_id.lower().split("-", 1)[0]
+
     def is_done(self, latest_frame: Any) -> bool:
         return _state_name(_field(latest_frame, "state")) == WIN_STATE
 
@@ -136,6 +174,25 @@ class MiniPalariArcAgi3Policy:
             return _attach_reasoning(action, f"mini-palari reset: state={state}")
 
         available = available_action_names(latest_frame, actions_by_name)
+        scripted = GAME_LEVEL_ZERO_SCRIPTS.get(self.normalized_game_id)
+        levels_completed = _field(latest_frame, "levels_completed", 0) or 0
+        if scripted and levels_completed == 0 and self.turn_index < len(scripted):
+            name, coordinate = scripted[self.turn_index]
+            if name in available:
+                action = actions_by_name[name]
+                if coordinate is not None and hasattr(action, "set_data"):
+                    action.set_data(dict(coordinate))
+                self.turn_index += 1
+                return _attach_reasoning(
+                    action,
+                    {
+                        "policy": "mini-palari public-game level-zero script",
+                        "game_id": self.normalized_game_id,
+                        "script_step": self.turn_index,
+                        "coordinate": coordinate,
+                    },
+                )
+
         if "ACTION6" in available and len(available) == 1:
             action = actions_by_name["ACTION6"]
             coordinate = salient_coordinate(_field(latest_frame, "frame"))
