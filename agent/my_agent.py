@@ -107,6 +107,21 @@ def _latest_grid(frame_payload: Any) -> list[list[int]]:
     return rows or [[0]]
 
 
+def frame_delta_count(previous_frame_payload: Any, current_frame_payload: Any) -> int:
+    previous = _latest_grid(previous_frame_payload)
+    current = _latest_grid(current_frame_payload)
+    height = max(len(previous), len(current))
+    width = max(max((len(row) for row in previous), default=0), max((len(row) for row in current), default=0))
+    changed = 0
+    for y in range(height):
+        previous_row = previous[y] if y < len(previous) else []
+        current_row = current[y] if y < len(current) else []
+        for x in range(width):
+            if (previous_row[x] if x < len(previous_row) else 0) != (current_row[x] if x < len(current_row) else 0):
+                changed += 1
+    return changed
+
+
 def salient_coordinate(frame_payload: Any) -> dict[str, int]:
     grid = _latest_grid(frame_payload)
     points: list[tuple[int, int]] = []
@@ -159,6 +174,7 @@ class MiniPalariArcAgi3Policy:
         self.simple_probe_sequence = simple_probe_sequence
         self.turn_index = 0
         self.trace_notes: list[dict[str, Any]] = []
+        self.last_probe_action: str | None = None
 
     @property
     def normalized_game_id(self) -> str:
@@ -204,10 +220,32 @@ class MiniPalariArcAgi3Policy:
             )
 
         non_reset = [name for name in available if name != "RESET"]
+        if self.last_probe_action in non_reset and frames:
+            changed = frame_delta_count(_field(frames[-1], "frame"), _field(latest_frame, "frame"))
+            self.trace_notes.append(
+                {
+                    "policy": "mini-palari generic probe planner",
+                    "action": self.last_probe_action,
+                    "evidence": "frame_delta" if changed else "no_frame_delta",
+                    "changed_cells": changed,
+                }
+            )
+            if changed:
+                return _attach_reasoning(
+                    actions_by_name[self.last_probe_action],
+                    {
+                        "policy": "mini-palari generic probe planner",
+                        "action": self.last_probe_action,
+                        "evidence": "repeat after frame delta",
+                        "changed_cells": changed,
+                    },
+                )
+
         for offset in range(len(self.simple_probe_sequence)):
             name = self.simple_probe_sequence[(self.turn_index + offset) % len(self.simple_probe_sequence)]
             if name in non_reset:
                 self.turn_index += offset + 1
+                self.last_probe_action = name
                 return _attach_reasoning(
                     actions_by_name[name],
                     f"mini-palari deterministic simple probe: {name}; game={self.game_id}",
