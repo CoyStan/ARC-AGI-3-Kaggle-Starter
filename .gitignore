@@ -15,6 +15,9 @@ logs.log
 # Generated artefacts
 notebooks/submission.ipynb
 reference/
+logs/
+model-eval/artifacts/
+models/
 
 # OS / editors
 .DS_Store
